@@ -1,0 +1,238 @@
+/*
+  ESP32 + RemoteXY (WiFi AP) — 4WD rover with Cytron MD10C (DIR+PWM per motor)
+  - Left slider: speed (0..255)
+  - Joystick Y: forward/back/stop (or spot turn L/R)
+  - Middle button (pushSwitch_01): kill switch
+  - Right button (spotturn): toggles spot turn mode
+  - value_01: shows PWM (0..255)
+  - led_01: LED=1 when driving
+*/
+
+//////////////////////////////////////////////
+// Driver mode: CYTRON (MD10C)
+//////////////////////////////////////////////
+#define DRIVER_MODE_CYTRON
+
+//////////////////////////////////////////////
+//        RemoteXY include library          //
+//   (Generated from your new config)       //
+//////////////////////////////////////////////
+
+// you can enable debug logging to Serial at 115200
+//#define REMOTEXY__DEBUGLOG    
+
+// RemoteXY select connection mode and include library 
+#define REMOTEXY_MODE__WIFI_POINT
+
+#include <WiFi.h>
+
+// RemoteXY connection settings 
+#define REMOTEXY_WIFI_SSID "RemoteXY" // Changed from "MaRS"
+#define REMOTEXY_WIFI_PASSWORD "12345678"
+#define REMOTEXY_SERVER_PORT 6377
+// #define REMOTEXY_ACCESS_PASSWORD "12345678" // This was in your new file, but not in the old. Uncomment if needed.
+
+
+#include <RemoteXY.h>
+
+// RemoteXY GUI configuration (93 bytes)
+#pragma pack(push, 1)  
+uint8_t RemoteXY_CONF[] =   // 93 bytes
+  { 255,5,0,5,0,86,0,19,0,0,0,75,65,80,73,0,31,1,200,84,
+  1,1,6,0,10,93,13,24,24,48,4,26,31,79,78,0,31,79,70,70,
+  0,70,68,2,18,18,16,26,37,0,4,21,11,18,55,0,2,26,67,67,
+  50,40,10,78,2,26,2,5,132,13,60,60,16,2,26,31,10,46,19,17,
+  17,48,37,26,31,79,78,0,31,79,70,70,0 };
+  
+// this structure defines all the variables and events of your control interface 
+struct {
+
+    // input variables
+  uint8_t pushSwitch_01; // =1 if state is ON, else =0, from 0 to 1 (Kill Switch)
+  int8_t slider_01; // from 0 to 100 (Speed)
+  int8_t joystick_01_x; // from -100 to 100 (Ignored)
+  int8_t joystick_01_y; // from -100 to 100 (Direction)
+  uint8_t spotturn; // =1 if state is ON, else =0, from 0 to 1 (Spot Turn Mode)
+
+    // output variables
+  uint8_t led_01; // from 0 to 1 (Driving Status)
+  float value_01; // PWM Value Display
+
+    // other variable
+  uint8_t connect_flag;  // =1 if wire connected, else =0
+
+} RemoteXY;   
+#pragma pack(pop)
+ 
+/////////////////////////////////////////////
+//           END RemoteXY include          //
+/////////////////////////////////////////////
+
+
+//////////////////////////////////////////////
+// Pins — DIR + PWM per wheel (edit if needed)
+//////////////////////////////////////////////
+#define DIR_FL  4
+#define PWM_FL 16
+#define DIR_FR 17
+#define PWM_FR  5
+#define DIR_BL 18
+#define PWM_BL 19
+#define DIR_BR 21
+#define PWM_BR 22
+
+// LEDC setup (high freq for MD10C)
+#define CH_FL 0
+#define CH_FR 1
+#define CH_BL 2
+#define CH_BR 3
+#define PWM_FREQ 20000   // 20 kHz (quiet, MD10C-friendly)
+#define PWM_RES  8       // 0..255
+
+// Debug (optional)
+#define DEBUG_BAUD 115200
+
+//////////////////////////////////////////////
+// Motor helper for Cytron MD10C
+//////////////////////////////////////////////
+class MotorCytron {
+public:
+  MotorCytron(int dir, int pwm, int ch) : dir_pin(dir), pwm_pin(pwm), channel(ch) {}
+  void begin() {
+    pinMode(dir_pin, OUTPUT);
+    ledcSetup(channel, PWM_FREQ, PWM_RES);
+    ledcAttachPin(pwm_pin, channel);
+    stop();
+  }
+  void setFwdPolarity(bool forward_is_high){ fwdHigh = forward_is_high; }
+  void forward(){ digitalWrite(dir_pin, fwdHigh ? HIGH : LOW); }
+  void backward(){ digitalWrite(dir_pin, fwdHigh ? LOW  : HIGH); }
+  void write(uint8_t d){ ledcWrite(channel, d); }
+  void stop(){ write(0); }
+private:
+  int dir_pin, pwm_pin, channel;
+  bool fwdHigh = true; // MD10C: typically HIGH = forward; flip per wheel if needed
+};
+
+MotorCytron M_FL(DIR_FL, PWM_FL, CH_FL);
+MotorCytron M_FR(DIR_FR, PWM_FR, CH_FR);
+MotorCytron M_BL(DIR_BL, PWM_BL, CH_BL);
+MotorCytron M_BR(DIR_BR, PWM_BR, CH_BR);
+
+static uint8_t g_pwm = 0;    // 0..255
+static bool driving = false;  // command state
+
+// --- Motor Control Helpers ---
+inline void allForward(){ M_FL.forward(); M_FR.forward(); M_BL.forward(); M_BR.forward(); }
+inline void allBackward(){M_FL.backward();M_FR.backward();M_BL.backward();M_BR.backward(); }
+inline void allPWM(uint8_t d){ M_FL.write(d); M_FR.write(d); M_BL.write(d); M_BR.write(d); }
+inline void allStop(){ M_FL.stop(); M_FR.stop(); M_BL.stop(); M_BR.stop(); }
+
+// --- NEW Spot Turn Helpers ---
+// Spot Turn Right (Clockwise): Left fwd, Right back
+inline void spotTurnRight() {
+  M_FL.forward(); M_BL.forward();
+  M_FR.backward(); M_BR.backward();
+}
+// Spot Turn Left (Counter-Clockwise): Left back, Right fwd
+inline void spotTurnLeft() {
+  M_FL.backward(); M_BL.backward();
+  M_FR.forward(); M_BR.forward();
+}
+
+
+void setup() {
+  Serial.begin(DEBUG_BAUD);
+  RemoteXY_Init();      // starts AP + server
+
+  M_FL.begin(); M_FR.begin(); M_BL.begin(); M_BR.begin();
+
+  // If any wheel’s “forward” is reversed, flip just that wheel here:
+  M_FL.setFwdPolarity(true);   // HIGH = forward (typical)
+  M_FR.setFwdPolarity(true);
+  M_BL.setFwdPolarity(true);
+  M_BR.setFwdPolarity(true);
+
+  g_pwm = 0; driving = false;
+  RemoteXY.value_01 = 0; 
+  RemoteXY.led_01 = 0; // Use new led_01
+
+  Serial.println("MD10C mode ready. Ensure common GND with ESP32 and motor battery.");
+}
+
+void loop() {
+  RemoteXY_Handler();
+
+  // Debug UI input (every 500 ms)
+  static uint32_t t = 0;
+  if (millis() - t > 500) {
+    t = millis();
+    // Updated Serial print to include new 'spotturn' variable
+    Serial.printf("conn=%u kill=%u spot=%u speed=%d joyY=%d -> pwm=%u drive=%u\n",
+      RemoteXY.connect_flag, RemoteXY.pushSwitch_01, RemoteXY.spotturn,
+      (int)RemoteXY.slider_01, (int)RemoteXY.joystick_01_y,
+      g_pwm, driving);
+  }
+
+  // Kill switch: must be OFF
+  if (RemoteXY.pushSwitch_01 == 1) {
+    driving = false; g_pwm = 0; allStop();
+    RemoteXY.value_01 = 0; 
+    RemoteXY.led_01 = 0; // Use new led_01
+    RemoteXY_delay(5);
+    return;
+  }
+
+  // Speed 0..100 -> 0..255
+  uint8_t target_pwm = map(constrain((int)RemoteXY.slider_01, 0, 100), 0, 100, 0, 255);
+
+  // Direction from joystick Y
+  const int deadband = 8;
+  int jy = constrain((int)RemoteXY.joystick_01_y, -100, 100);
+
+  // === NEW LOGIC with Spot Turn Mode ===
+  if (RemoteXY.spotturn == 1) {
+    // --- SPOT TURN MODE ---
+    if (target_pwm == 0 || abs(jy) <= deadband) {
+      // Stop
+      g_pwm = 0;
+    } else if (jy > deadband) {
+      // Spot Turn Right (as requested: "joystick up")
+      spotTurnRight(); 
+      g_pwm = target_pwm;
+    } else { // jy < -deadband
+      // Spot Turn Left (as requested: "joystick down")
+      spotTurnLeft();
+      g_pwm = target_pwm;
+    }
+
+  } else {
+    // --- NORMAL 4WD MODE ---
+    if (target_pwm == 0 || abs(jy) <= deadband) {
+      // Stop
+      g_pwm = 0;
+    } else if (jy > deadband) {
+      // Forward
+      allForward();
+      g_pwm = target_pwm;
+    } else { // jy < -deadband
+      // Backward
+      allBackward();
+      g_pwm = target_pwm;
+    }
+  }
+  // === END NEW LOGIC ===
+
+
+  // Apply the calculated PWM to all motors
+  allPWM(g_pwm);
+  
+  // Update the 'driving' state *after* the logic, based on the result.
+  driving = (g_pwm > 0);
+
+  // Update RemoteXY outputs
+  RemoteXY.value_01 = (float)g_pwm;      // update display
+  RemoteXY.led_01 = driving ? 1 : 0;     // Use new led_01 for status
+
+  RemoteXY_delay(5);
+}
