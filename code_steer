@@ -1,0 +1,269 @@
+/*
+   -- New 5-Variable Project --
+   
+   This code is for a 5-variable RemoteXY layout with:
+   - 4x Sliders (FL_S, FR_S, BL_S, BR_S)
+   - 1x Switch (Spot_TURN_Mode)
+   
+   PWM Logic:
+   - Manual Mode: Sliders map 0-100% to 0-100 PWM value.
+   - Spot Turn Mode: Fixed at 70 PWM value, controlled by FR_S slider.
+*/
+
+//////////////////////////////////////////////
+//        RemoteXY include library          //
+//////////////////////////////////////////////
+
+// you can enable debug logging to Serial at 115200
+//#define REMOTEXY__DEBUGLOG    
+
+// RemoteXY select connection mode and include library 
+#define REMOTEXY_MODE__WIFI_POINT
+#include <WiFi.h>
+
+// RemoteXY connection settings 
+#define REMOTEXY_WIFI_SSID "MaRS_STEER"
+#define REMOTEXY_WIFI_PASSWORD "12345678"
+#define REMOTEXY_SERVER_PORT 6377
+
+
+#include <RemoteXY.h>
+
+// RemoteXY GUI configuration  
+#pragma pack(push, 1)  
+// This is the new 69-byte config you provided
+uint8_t RemoteXY_CONF[] =   // 69 bytes
+  { 255,5,0,0,0,62,0,19,0,0,0,0,31,1,200,84,1,1,5,0,
+  4,91,53,36,8,176,2,26,4,143,53,36,8,176,2,26,4,92,14,36,
+  8,176,2,26,4,143,13,36,8,176,2,26,2,26,32,30,12,0,2,26,
+  31,31,79,78,0,79,70,70,0 };
+  
+// this structure defines all the variables and events of your control interface 
+struct {
+
+    // input variables
+  int8_t BR_S; // from -100 to 100
+  int8_t BL_S; // from -100 to 100
+  int8_t FL_S; // from -100 to 100
+  int8_t FR_S; // from -100 to 100
+  uint8_t Spot_TURN_Mode; // =1 if switch ON and =0 if OFF, from 0 to 1
+
+    // other variable
+  uint8_t connect_flag;  // =1 if wire connected, else =0
+
+} RemoteXY;   
+#pragma pack(pop)
+ 
+/////////////////////////////////////////////
+//           END RemoteXY include          //
+/////////////////////////////////////////////
+
+
+/////////////////////////////////////////////
+//         Motor Pin Definitions           //
+/////////////////////////////////////////////
+
+// front left
+#define dir_fl 4  
+#define pwm_fl 16
+#define ch_fl 0
+
+//front right
+#define dir_fr 17
+#define pwm_fr 5
+#define ch_fr 1
+
+//back left
+#define dir_bl 13
+#define pwm_bl 14
+#define ch_bl 2
+
+//back right
+#define dir_br 23
+#define pwm_br 22
+#define ch_br 3
+
+
+/////////////////////////////////////////////
+//           Motor Control Class           //
+/////////////////////////////////////////////
+class motor
+{
+private:
+  int dir_pin;
+  int pwm_pin;
+  int channel;
+
+public:
+  motor(int, int,int);
+  void clockwise();
+  void anticlockwise();
+  void set_pwm(int); // Renamed from 'pwm' to avoid conflict
+  void stop();
+};
+
+motor::motor(int pin1, int pin2,int ch)
+{
+  dir_pin = pin1;
+  pwm_pin = pin2;
+  channel = ch;
+  pinMode(dir_pin, OUTPUT);
+  ledcSetup(channel, 5000, 8); // 5kHz frequency, 8-bit resolution
+  ledcAttachPin(pwm_pin, channel);
+}
+
+// all clockwise and anticlockwise dir are assumed to be from the top 
+void motor::clockwise() 
+{
+  digitalWrite(dir_pin, LOW); // CHECK THIS: Adjust if motor direction is wrong
+}
+
+void motor::anticlockwise()
+{
+  digitalWrite(dir_pin, HIGH); // CHECK THIS: Adjust if motor direction is wrong
+}
+
+void motor::set_pwm(int input_pwm)
+{
+  input_pwm = constrain(input_pwm, 0, 255);
+  ledcWrite(channel, input_pwm);
+}
+
+void motor::stop()
+{
+  ledcWrite(channel, 0);
+}
+
+// Create motor objects
+motor motorFLS(dir_fl, pwm_fl, ch_fl);
+motor motorFRS(dir_fr, pwm_fr, ch_fr);
+motor motorBRS(dir_br, pwm_br, ch_br);
+motor motorBLS(dir_bl, pwm_bl, ch_bl);
+
+
+/////////////////////////////////////////////
+//        Motor Helper Functions           //
+/////////////////////////////////////////////
+
+/**
+ * Stops all four motors.
+ */
+void all_stop()
+{
+  motorFLS.stop();
+  motorFRS.stop();
+  motorBLS.stop();
+  motorBRS.stop();
+}
+
+/**
+ * Sets a single motor's speed and direction based on a -100 to 100 input.
+ * @param m The motor object to control.
+ * @param speed_percent The desired speed from -100 (full reverse) to 100 (full forward).
+ * @param max_pwm_value The absolute maximum PWM value (0-255) to use at 100% slider.
+ */
+void set_motor_speed(motor &m, int speed_percent, int max_pwm_value)
+{
+  // Constrain speed to -100 to 100
+  speed_percent = constrain(speed_percent, -100, 100);
+
+  // Determine direction
+  if (speed_percent > 0) {
+    m.clockwise();
+  } else if (speed_percent < 0) {
+    m.anticlockwise();
+  }
+
+  // Calculate the final PWM value
+  // Map the speed_percent (0-100) to the max_pwm_value
+  int final_pwm = map(abs(speed_percent), 0, 100, 0, max_pwm_value);
+
+  if (speed_percent == 0) {
+    m.stop();
+  } else {
+    m.set_pwm(final_pwm);
+  }
+}
+
+/**
+ * Performs a spot turn at a fixed 70 PWM, controlled by the FR_S slider.
+ * @param fr_s_value The value of the FR_S slider (-100 to 100).
+ */
+void controlled_spot_turn(int8_t fr_s_value)
+{
+  // Set the fixed PWM value to 70 (out of 255)
+  int fixed_pwm = 70;
+
+  // Define a deadzone for the slider
+  int deadzone = 10; 
+
+  if (fr_s_value > deadzone) {
+    // Clockwise spot turn (slide right/up)
+    motorFRS.anticlockwise();
+    motorBRS.anticlockwise();
+    motorFLS.clockwise(); 
+    motorBLS.clockwise();
+    
+    // Set all motors to the fixed 70 PWM
+    motorFLS.set_pwm(fixed_pwm);
+    motorFRS.set_pwm(fixed_pwm);
+    motorBLS.set_pwm(fixed_pwm);
+    motorBRS.set_pwm(fixed_pwm);
+    
+  } else if (fr_s_value < -deadzone) {
+    // Counter-clockwise spot turn (slide left/down)
+    motorFRS.clockwise();
+    motorBRS.clockwise();
+    motorFLS.anticlockwise();
+    motorBLS.anticlockwise();
+    
+    // Set all motors to the fixed 70 PWM
+    motorFLS.set_pwm(fixed_pwm);
+    motorFRS.set_pwm(fixed_pwm);
+    motorBLS.set_pwm(fixed_pwm);
+    motorBRS.set_pwm(fixed_pwm);
+    
+  } else {
+    // Slider is in the center, stop all motors
+    all_stop();
+  }
+}
+
+
+/////////////////////////////////////////////
+//              Main Setup                 //
+/////////////////////////////////////////////
+void setup() 
+{
+  RemoteXY_Init (); 
+  
+  // Motor class constructor already handles pinModes and ledcSetup
+  all_stop(); // Ensure motors are off at start
+}
+
+/////////////////////////////////////////////
+//               Main Loop                 //
+/////////////////////////////////////////////
+void loop() 
+{ 
+  RemoteXY_Handler ();
+  
+  // --- Mode Control ---
+
+  if (RemoteXY.Spot_TURN_Mode == 1) {
+    // --- SPOT TURN MODE ---
+    // Use the FR_S slider to control the spot turn at a fixed 70 PWM
+    controlled_spot_turn(RemoteXY.FR_S);
+  } 
+  else {
+    // --- MANUAL MODE ---
+    // Each slider controls its own wheel, mapping 0-100% to 0-100 PWM
+    set_motor_speed(motorFLS, RemoteXY.FL_S, 100);
+    set_motor_speed(motorFRS, RemoteXY.FR_S, 100);
+    set_motor_speed(motorBLS, RemoteXY.BL_S, 100);
+    set_motor_speed(motorBRS, RemoteXY.BR_S, 100);
+  }
+  
+  // Use the RemoteXY_delay() function instead of delay()
+  RemoteXY_delay(10);
+}
